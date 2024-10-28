@@ -65,6 +65,15 @@ class Email(ValidatorBase):
                 raise ValueError("Missing domain part of email string (part after the '@').")
 
 
+class Enum(ValidatorBase):
+    def __init__(self, *values):
+        self.values = values
+    
+    def __call__(self, value):
+        if value not in self.values:
+            raise ValueError(f"Not one of {self.values}")
+
+
 class Exact(ValidatorBase):
     def __init__(self, value):
         self.value = value
