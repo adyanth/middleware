@@ -2,6 +2,7 @@ from datetime import time
 import ipaddress
 import os
 import re
+import json
 from urllib.parse import urlparse
 import uuid
 from string import digits, ascii_uppercase, ascii_lowercase, punctuation
@@ -80,6 +81,34 @@ class IpAddress(ValidatorBase):
         except ValueError:
             raise ValueError('Not a valid IP address')
 
+
+class JsonSchema(ValidatorBase):
+    def __init__(self, fields=None):
+        self.fields = {}
+        if fields is not None:
+            assert isinstance(fields, list) or isinstance(fields, dict)
+            if isinstance(fields, list):
+                # Use an always ok validator
+                self.fields = {k: lambda x: None for k in fields}
+            if isinstance(fields, dict):
+                for k, v in fields.items():
+                    assert isinstance(k, str)
+                    assert issubclass(v, ValidatorBase)
+                self.fields = fields
+
+    def __call__(self, value):
+        # Throws ValueError is not valid json
+        try:
+            data = json.loads(value)
+        except ValueError:
+            raise ValueError('Not a valid JSON')
+        for key, validator in self.fields.items():
+            if key not in data:
+                raise ValueError(f'Field `{key}` not found in json')
+            try:
+                validator(data[key])
+            except Exception as e:
+                raise ValueError(f'Field `{key}` failed validation: {e}')
 
 class Netmask(ValidatorBase):
     def __init__(self, ipv4=True, ipv6=True, prefix_length=True):
