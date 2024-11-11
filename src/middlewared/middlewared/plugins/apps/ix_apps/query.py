@@ -26,20 +26,21 @@ class VolumeMount:
 
 def upgrade_available_for_app(
     version_mapping: dict[str, dict[str, dict[str, str]]], app_metadata: dict, image_updates_available: bool = False,
-) -> bool:
+) -> tuple[bool, str | None]:
     # TODO: Eventually we would want this to work as well but this will always require middleware changes
     #  depending on what new functionality we want introduced for custom app, so let's take care of this at that point
     catalog_app_metadata = app_metadata['metadata']
     if app_metadata['custom_app'] is False and version_mapping.get(
         catalog_app_metadata['train'], {}
     ).get(catalog_app_metadata['name']):
+        latest_version = version_mapping[catalog_app_metadata['train']][catalog_app_metadata['name']]['version']
         return parse_version(catalog_app_metadata['version']) < parse_version(
-            version_mapping[catalog_app_metadata['train']][catalog_app_metadata['name']]['version']
-        )
+            latest_version
+        ), latest_version
     elif app_metadata['custom_app'] and image_updates_available:
-        return True
+        return True, None
     else:
-        return False
+        return False, None
 
 
 def normalize_portal_uri(portal_uri: str, host_ip: str | None) -> str:
@@ -108,15 +109,23 @@ def list_apps(
         image_updates_available = any(
             image_update_cache.get(normalize_reference(k)['complete_tag']) for k in active_workloads['images']
         )
+        upgrade_available, latest_version = upgrade_available_for_app(train_to_apps_version_mapping, app_metadata)
         app_data = {
             'name': app_name,
             'id': app_name,
             'active_workloads': active_workloads,
             'state': state,
-            'upgrade_available': upgrade_available_for_app(train_to_apps_version_mapping, app_metadata),
+            'upgrade_available': upgrade_available,
+            'latest_version': latest_version,
             'image_updates_available': image_updates_available,
             **app_metadata | {'portals': normalize_portal_uris(app_metadata['portals'], host_ip)}
         }
+        if app_data['custom_app'] and image_updates_available:
+            # We want to mark custom apps as upgrade available if image updates are available
+            # so if user tries to upgrade, we will just be pulling a newer version of the image
+            # against the same docker tag
+            app_data['upgrade_available'] = True
+
         apps.append(app_data | get_config_of_app(app_data, collective_config, retrieve_config))
 
     if specific_app and specific_app in app_names:
@@ -133,12 +142,14 @@ def list_apps(
                 continue
 
             app_metadata = metadata[entry.name]
+            upgrade_available, latest_version = upgrade_available_for_app(train_to_apps_version_mapping, app_metadata)
             app_data = {
                 'name': entry.name,
                 'id': entry.name,
                 'active_workloads': get_default_workload_values(),
                 'state': AppState.STOPPED.value,
-                'upgrade_available': upgrade_available_for_app(train_to_apps_version_mapping, app_metadata),
+                'upgrade_available': upgrade_available,
+                'latest_version': latest_version,
                 'image_updates_available': False,
                 **app_metadata | {'portals': normalize_portal_uris(app_metadata['portals'], host_ip)}
             }
@@ -154,6 +165,7 @@ def get_default_workload_values() -> dict:
         'container_details': [],  # This would contain service name and image in use
         'volumes': [],  # This would be docker volumes
         'images': [],
+        'networks': [],
     }
 
 
@@ -224,5 +236,6 @@ def translate_resources_to_desired_workflow(app_resources: dict) -> dict:
     workloads.update({
         'images': list(images),
         'volumes': [v.__dict__ for v in volumes],
+        'networks': app_resources['networks'],
     })
     return workloads

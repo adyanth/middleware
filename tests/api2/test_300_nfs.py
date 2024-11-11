@@ -222,9 +222,13 @@ def set_immutable_state(path: str, want_immutable=True):
     '''
     Used by exportsd test
     '''
-    call('filesystem.set_immutable', want_immutable, path)
-    res = call('filesystem.is_immutable', '/etc/exports.d')
-    assert res is want_immutable, f"Expected mutable filesystem: {res}"
+    call('filesystem.set_zfs_attributes', {
+        'path': path,
+        'zfs_file_attributes': {'immutable': want_immutable}
+    })
+    is_immutable = 'IMMUTABLE' in call('filesystem.stat', '/etc/exports.d')['attributes']
+
+    assert is_immutable is want_immutable, f"Expected mutable filesystem: {want_immutable}"
 
 
 def confirm_nfsd_processes(expected):
@@ -1689,7 +1693,7 @@ class TestNFSops:
                                     flag_is_set = acl_flag
 
                                 # Now ensure that only the expected flag is set
-                                nfs41_flags = result['nfs41_flags']
+                                nfs41_flags = result['aclflags']
                                 for flag in ['autoinherit', 'protected', 'defaulted']:
                                     if flag == flag_is_set:
                                         assert nfs41_flags[flag], nfs41_flags
@@ -1733,6 +1737,35 @@ class TestNFSops:
 
             s = parse_server_config()
             assert s['mountd']['manage-gids'] == expected, str(s)
+
+    def test_rdma_config(self, start_nfs):
+        '''
+        Mock response from rdma.capable_protocols to confirm NFS over RDMA config setting
+        '''
+        assert start_nfs is True
+
+        # Confirm the setting does not exist by default
+        s = parse_server_config()
+        assert s.get('rdma') is None, str(s)
+
+        # RDMA setting should fail on a test vm.
+        with pytest.raises(ValidationErrors) as ve:
+            call("nfs.update", {"rdma": True})
+        assert ve.value.errors == [
+            ValidationError(
+                'nfs_update.rdma',
+                'This platform cannot support NFS over RDMA or is missing an RDMA capable NIC.',
+                22
+            )
+        ]
+
+        with mock("rdma.capable_protocols", return_value=['NFS']):
+            with nfs_config():
+                call("nfs.update", {"rdma": True})
+                s = parse_server_config()
+                assert s['nfsd']['rdma'] == 'y', str(s)
+                # 20049 is the default port for NFS over RDMA.
+                assert s['nfsd']['rdma-port'] == '20049', str(s)
 
 
 def test_pool_delete_with_attached_share():

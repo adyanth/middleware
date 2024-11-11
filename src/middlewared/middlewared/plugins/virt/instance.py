@@ -1,7 +1,8 @@
 import aiohttp
+import platform
 
 from middlewared.service import (
-    CRUDService, ValidationErrors, filterable, job, private
+    CallError, CRUDService, ValidationErrors, filterable, job, private
 )
 from middlewared.utils import filter_list
 
@@ -16,7 +17,7 @@ from middlewared.api.current import (
     VirtInstanceRestartArgs, VirtInstanceRestartResult,
     VirtInstanceImageChoicesArgs, VirtInstanceImageChoicesResult,
 )
-from .utils import incus_call, incus_call_and_wait
+from .utils import Status, incus_call, incus_call_and_wait
 
 
 LC_IMAGES_SERVER = 'https://images.linuxcontainers.org'
@@ -36,9 +37,10 @@ class VirtInstanceService(CRUDService):
         """
         Query all instances with `query-filters` and `query-options`.
         """
-        config = await self.middleware.call('virt.global.config')
-        if config['state'] != 'INITIALIZED':
-            return []
+        if not options['extra'].get('skip_state'):
+            config = await self.middleware.call('virt.global.config')
+            if config['state'] != Status.INITIALIZED.value:
+                return []
         results = (await incus_call('1.0/instances?filter=&recursion=2', 'get'))['metadata']
         entries = []
         for i in results:
@@ -51,12 +53,21 @@ class VirtInstanceService(CRUDService):
                 'type': 'CONTAINER' if i['type'] == 'container' else 'VM',
                 'status': i['state']['status'].upper(),
                 'cpu': i['config'].get('limits.cpu'),
-                'autostart': i['config'].get('boot.autostart') or False,
+                'autostart': True if i['config'].get('boot.autostart') == 'true' else False,
                 'environment': {},
                 'aliases': [],
+                'image': {
+                    'architecture': i['config'].get('image.architecture'),
+                    'description': i['config'].get('image.description'),
+                    'os': i['config'].get('image.os'),
+                    'release': i['config'].get('image.release'),
+                    'serial': i['config'].get('image.serial'),
+                    'type': i['config'].get('image.type'),
+                    'variant': i['config'].get('image.variant'),
+                }
             }
 
-            if options.get('extra').get('raw'):
+            if options['extra'].get('raw'):
                 entry['raw'] = i
 
             if memory := i['config'].get('limits.memory'):
@@ -116,18 +127,27 @@ class VirtInstanceService(CRUDService):
         if data['remote'] == 'LINUX_CONTAINERS':
             url = LC_IMAGES_JSON
 
+        current_arch = platform.machine()
+        if current_arch == 'x86_64':
+            current_arch = 'amd64'
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
-                data = await resp.json()
-                for v in data['products'].values():
+                for v in (await resp.json())['products'].values():
+                    # For containers we only want images matching current platform
+                    if data['instance_type'] == 'CONTAINER' and v['arch'] != current_arch:
+                        continue
                     alias = v['aliases'].split(',', 1)[0]
-                    choices[alias] = {
-                        'label': f'{v["os"]} {v["release"]} ({v["arch"]}, {v["variant"]})',
-                        'os': v['os'],
-                        'release': v['release'],
-                        'arch': v['arch'],
-                        'variant': v['variant'],
-                    }
+                    if alias not in choices:
+                        choices[alias] = {
+                            'label': f'{v["os"]} {v["release"]} ({v["arch"]}, {v["variant"]})',
+                            'os': v['os'],
+                            'release': v['release'],
+                            'archs': [v['arch']],
+                            'variant': v['variant'],
+                        }
+                    else:
+                        choices[alias]['archs'].append(v['arch'])
         return choices
 
     @api_method(VirtInstanceCreateArgs, VirtInstanceCreateResult)
@@ -180,7 +200,7 @@ class VirtInstanceService(CRUDService):
             'devices': devices,
             'source': source,
             'type': 'container' if data['instance_type'] == 'CONTAINER' else 'virtual-machine',
-            'start': True,
+            'start': data['autostart'],
         }}, running_cb)
 
         return await self.middleware.call('virt.instance.get_instance', data['name'])
@@ -195,7 +215,7 @@ class VirtInstanceService(CRUDService):
         instance = await self.middleware.call('virt.instance.get_instance', id, {'extra': {'raw': True}})
 
         verrors = ValidationErrors()
-        await self.validate(data, 'virt_instance_create', verrors, old=instance)
+        await self.validate(data, 'virt_instance_update', verrors, old=instance)
         verrors.check()
 
         instance['raw']['config'].update(self.__data_to_config(data))
@@ -223,15 +243,27 @@ class VirtInstanceService(CRUDService):
         return True
 
     @api_method(VirtInstanceStartArgs, VirtInstanceStartResult, roles=['VIRT_INSTANCE_WRITE'])
-    @job()
+    @job(logs=True)
     async def start(self, job, id):
         """
         Start an instance.
         """
         await self.middleware.call('virt.global.check_initialized')
-        await incus_call_and_wait(f'1.0/instances/{id}/state', 'put', {'json': {
-            'action': 'start',
-        }})
+        instance = await self.middleware.call('virt.instance.get_instance', id)
+
+        try:
+            await incus_call_and_wait(f'1.0/instances/{id}/state', 'put', {'json': {
+                'action': 'start',
+            }})
+        except CallError:
+            log = 'lxc.log' if instance['type'] == 'CONTAINER' else 'qemu.log'
+            content = await incus_call(f'1.0/instances/{id}/logs/{log}', 'get', json=False)
+            output = []
+            while line := await content.readline():
+                output.append(line)
+                output = output[-10:]
+            await job.logs_fd_write(b''.join(output).strip())
+            raise CallError('Failed to start instance. Please check job logs.')
 
         return True
 
@@ -243,7 +275,8 @@ class VirtInstanceService(CRUDService):
 
         Timeout is how long it should wait for the instance to shutdown cleanly.
         """
-        await self.middleware.call('virt.global.check_initialized')
+        # Only check started because its used when tearing the service down
+        await self.middleware.call('virt.global.check_started')
         await incus_call_and_wait(f'1.0/instances/{id}/state', 'put', {'json': {
             'action': 'stop',
             'timeout': data['timeout'],
@@ -262,7 +295,7 @@ class VirtInstanceService(CRUDService):
         """
         await self.middleware.call('virt.global.check_initialized')
         instance = await self.middleware.call('virt.instance.get_instance', id)
-        if instance['state'] == 'RUNNING':
+        if instance['status'] == 'RUNNING':
             await incus_call_and_wait(f'1.0/instances/{id}/state', 'put', {'json': {
                 'action': 'stop',
                 'timeout': data['timeout'],

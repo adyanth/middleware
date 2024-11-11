@@ -1,4 +1,3 @@
-from collections import defaultdict
 import errno
 import glob
 import json
@@ -17,9 +16,7 @@ from sqlalchemy.orm import relationship
 from dataclasses import asdict
 from middlewared.api import api_method
 from middlewared.api.current import *
-from middlewared.service import (
-    CallError, CRUDService, ValidationErrors, no_auth_required, no_authz_required, pass_app, private, filterable, job
-)
+from middlewared.service import CallError, CRUDService, ValidationErrors, pass_app, private, job
 from middlewared.service_exception import MatchNotFound
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, filter_list
@@ -380,7 +377,8 @@ class UserService(CRUDService):
                 self.validate_homedir_mountinfo(verrors, schema, p.parent)
 
         elif self.validate_homedir_mountinfo(verrors, schema, p):
-            if self.middleware.call_sync('filesystem.is_immutable', data['home']):
+            attrs = self.middleware.call_sync('filesystem.stat', data['home'])['attributes']
+            if 'IMMUTABLE' in attrs:
                 verrors.add(
                     f'{schema}.home',
                     f'{data["home"]}: home directory path is immutable.'
@@ -1090,8 +1088,10 @@ class UserService(CRUDService):
 
         return last_uid + 1
 
-    @no_auth_required
-    @api_method(UserHasLocalAdministratorSetUpArgs, UserHasLocalAdministratorSetUpResult)
+    @api_method(
+        UserHasLocalAdministratorSetUpArgs, UserHasLocalAdministratorSetUpResult,
+        authentication_required=False
+    )
     async def has_local_administrator_set_up(self):
         """
         Return whether a local administrator with a valid password exists.
@@ -1101,8 +1101,11 @@ class UserService(CRUDService):
         """
         return len(await self.middleware.call('privilege.local_administrators')) > 0
 
-    @no_auth_required
-    @api_method(UserSetupLocalAdministratorArgs, UserSetupLocalAdministratorResult, audit='Set up local administrator')
+    @api_method(
+        UserSetupLocalAdministratorArgs, UserSetupLocalAdministratorResult,
+        audit='Set up local administrator',
+        authentication_required=False
+    )
     @pass_app()
     async def setup_local_administrator(self, app, username, password, options):
         """
@@ -1413,9 +1416,9 @@ class UserService(CRUDService):
             os.fchown(f.fileno(), user['uid'], gid)
             f.write(f'{pubkey}\n')
 
-    @no_authz_required
     @api_method(UserSetPasswordArgs, UserSetPasswordResult,
-                audit='Set account password', audit_extended=lambda data: data['username'])
+                audit='Set account password', audit_extended=lambda data: data['username'],
+                authorization_required=False)
     @pass_app(require=True)
     async def set_password(self, app, data):
         """
@@ -1605,7 +1608,6 @@ class GroupService(CRUDService):
 
         return group
 
-    @filterable
     async def query(self, filters, options):
         """
         Query groups with `query-filters` and `query-options`.
@@ -2027,5 +2029,15 @@ class GroupService(CRUDService):
 
 
 async def setup(middleware):
+    try:
+        # ensure that our default home path is always immutable. If it's not immutable then
+        # pam_mkhomedir will start creating dirs within it on user login
+        await middleware.call('filesystem.set_zfs_attributes', {
+            'path': DEFAULT_HOME_PATH,
+            'zfs_file_attributes': {'immutable': True}
+        })
+    except Exception:
+        middleware.logger.error('Failed to set immutable property on %r', DEFAULT_HOME_PATH, exc_info=True)
+
     if await middleware.call('keyvalue.get', 'run_migration', False):
         await middleware.call('user.sync_builtin')

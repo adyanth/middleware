@@ -58,6 +58,9 @@ async def restic(middleware, job, cloud_backup, dry_run):
         if cmd is None:
             cmd = [local_path]
 
+        args = await middleware.call("cloud_backup.transfer_setting_args")
+        cmd.extend(args[cloud_backup["transfer_setting"]])
+
         if dry_run:
             cmd.append("-n")
 
@@ -65,7 +68,7 @@ async def restic(middleware, job, cloud_backup, dry_run):
 
         cmd = restic_config.cmd + ["--verbose", "backup"] + cmd
 
-        await run_restic(job, cmd, restic_config.env, stdin)
+        await run_restic(job, cmd, restic_config.env, stdin, track_progress=True)
     finally:
         if stdin:
             try:
@@ -131,6 +134,8 @@ class CloudBackupService(Service):
 
             if "id" in cloud_backup:
                 await self.middleware.call("alert.oneshot_delete", "CloudBackupTaskFailed", cloud_backup["id"])
+            
+            job.set_progress(description="Done")
         except Exception:
             if "id" in cloud_backup:
                 await self.middleware.call("alert.oneshot_create", "CloudBackupTaskFailed", {

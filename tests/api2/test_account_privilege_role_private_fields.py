@@ -71,9 +71,10 @@ def dns_authenticator():
     with row(
         "system.acmednsauthenticator",
         {
-            "authenticator": "cloudflare",
             "name": "test",
             "attributes": {
+                "authenticator": "cloudflare",
+                "cloudflare_email": "test@gmail.com",
                 "api_key": "key",
                 "api_token": "token",
             },
@@ -167,9 +168,9 @@ def vmware():
     ("acme.dns.authenticator", dns_authenticator, {}, ["attributes"]),
     ("certificate", 1, {}, ["privatekey", "issuer"]),
     ("certificateauthority", certificateauthority, {}, ["privatekey", "issuer"]),
-    ("cloud_backup", cloudbackup, {}, ["credentials.attributes", "password"]),
-    ("cloudsync.credentials", cloudsync_credential, {}, ["attributes"]),
-    ("cloudsync", cloudsync, {}, ["credentials.attributes", "encryption_password"]),
+    ("cloud_backup", cloudbackup, {}, ["credentials.provider", "password"]),
+    ("cloudsync.credentials", cloudsync_credential, {}, ["provider.pass"]),
+    ("cloudsync", cloudsync, {}, ["credentials.provider", "encryption_password"]),
     ("disk", disk, {"extra": {"passwords": True}}, ["passwd"]),
     ("idmap", idmap, {}, ["options.ldap_user_dn_password"]),
     ("iscsi.auth", iscsi_auth, {}, ["secret", "peersecret"]),

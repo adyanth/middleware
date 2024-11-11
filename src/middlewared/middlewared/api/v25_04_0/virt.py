@@ -63,18 +63,20 @@ class VirtGlobalGetNetworkResult(BaseModel):
 
 
 REMOTE_CHOICES: TypeAlias = Literal['LINUX_CONTAINERS']
+InstanceType: TypeAlias = Literal['CONTAINER', 'VM']
 
 
 @single_argument_args('virt_instances_image_choices')
 class VirtInstanceImageChoicesArgs(BaseModel):
     remote: REMOTE_CHOICES = 'LINUX_CONTAINERS'
+    instance_type: InstanceType = 'CONTAINER'
 
 
 class ImageChoiceItem(BaseModel):
     label: str
     os: str
     release: str
-    arch: str
+    archs: list[str]
     variant: str
 
 
@@ -152,7 +154,14 @@ class VirtInstanceAlias(BaseModel):
     netmask: int
 
 
-InstanceType: TypeAlias = Literal['CONTAINER', 'VM']
+class Image(BaseModel):
+    architecture: str | None
+    description: str | None
+    os: str | None
+    release: str | None
+    serial: str | None
+    type: str | None
+    variant: str | None
 
 
 class VirtInstanceEntry(BaseModel):
@@ -165,7 +174,15 @@ class VirtInstanceEntry(BaseModel):
     autostart: bool
     environment: dict[str, str]
     aliases: List[VirtInstanceAlias]
+    image: Image
     raw: dict
+
+
+# Lets require at least 32MiB of reserved memory
+# This value is somewhat arbitrary but hard to think lower value would have to be used
+# (would most likely be a typo).
+# Running container with very low memory will probably cause it to be killed by the cgroup OOM
+MemoryType: TypeAlias = Annotated[int, Field(strict=True, ge=33554432)]
 
 
 @single_argument_args('virt_instance_create')
@@ -174,22 +191,22 @@ class VirtInstanceCreateArgs(BaseModel):
     image: Annotated[NonEmptyString, StringConstraints(max_length=200)]
     remote: REMOTE_CHOICES = 'LINUX_CONTAINERS'
     instance_type: InstanceType = 'CONTAINER'
-    environment: dict | None = None
-    autostart: bool | None = None
+    environment: dict[str, str] | None = None
+    autostart: bool | None = True
     cpu: str | None = None
-    memory: int | None = None
     devices: List[DeviceType] = None
+    memory: MemoryType | None = None
 
 
 class VirtInstanceCreateResult(BaseModel):
-    result: dict
+    result: VirtInstanceEntry
 
 
 class VirtInstanceUpdate(BaseModel, metaclass=ForUpdateMetaclass):
-    environment: dict | None = None
+    environment: dict[str, str] | None = None
     autostart: bool | None = None
     cpu: str | None = None
-    memory: int | None = None
+    memory: MemoryType | None = None
 
 
 class VirtInstanceUpdateArgs(BaseModel):

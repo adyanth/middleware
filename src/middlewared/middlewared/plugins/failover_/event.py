@@ -287,10 +287,10 @@ class FailoverEventsService(Service):
 
             # If there is a state change on a non-critical interface then
             # ignore the event and return
-            ignore = [i for i in fobj['non_crit_interfaces'] if i in ifname]
-            if ignore:
-                logger.warning('Ignoring state change on non-critical interface "%s".', ifname)
-                raise IgnoreFailoverEvent()
+            for i in fobj['non_crit_interfaces']:
+                if i == ifname:
+                    logger.warning('Ignoring state change on non-critical interface "%s".', ifname)
+                    raise IgnoreFailoverEvent()
 
             needs_imported = False
             for pool in self.run_call('pool.query', [('name', 'in', [i['name'] for i in fobj['volumes']])]):
@@ -675,6 +675,9 @@ class FailoverEventsService(Service):
         logger.info('Starting background job for directoryservices.setup')
         self.run_call('directoryservices.setup')
         logger.info('Done starting background job for directoryservices.setup')
+
+        logger.info('Starting background job for prefetching DDT for zpools')
+        self.middleware.create_task(self.middleware.call('zfs.pool.ddt_prefetch_pools'))
 
         logger.info('Allowing network traffic.')
         fw_accept_job = self.run_call('failover.firewall.accept_all')

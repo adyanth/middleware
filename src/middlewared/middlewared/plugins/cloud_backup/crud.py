@@ -2,7 +2,7 @@ from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertLevel,
 from middlewared.common.attachment import LockableFSAttachmentDelegate
 from middlewared.plugins.cloud.crud import CloudTaskServiceMixin
 from middlewared.plugins.cloud.model import CloudTaskModelMixin, cloud_task_schema
-from middlewared.schema import accepts, Bool, Cron, Dict, Int, Password, Patch
+from middlewared.schema import accepts, Bool, Cron, Dict, Int, Password, Patch, Str
 from middlewared.service import pass_app, private, TaskPathService, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.utils.path import FSLocation
@@ -16,6 +16,7 @@ class CloudBackupModel(CloudTaskModelMixin, sa.Model):
 
     password = sa.Column(sa.EncryptedText())
     keep_last = sa.Column(sa.Integer())
+    transfer_setting = sa.Column(sa.String(16), default="DEFAULT")
 
 
 class CloudBackupService(TaskPathService, CloudTaskServiceMixin, TaskStateMixin):
@@ -37,10 +38,18 @@ class CloudBackupService(TaskPathService, CloudTaskServiceMixin, TaskStateMixin)
         'cloud_backup_create',
         'cloud_backup_entry',
         ('add', Int('id')),
-        ("replace", Dict("credentials", additional_attrs=True, private_keys=["attributes"])),
+        ("replace", Dict("credentials", additional_attrs=True, private_keys=["provider"])),
         ("add", Dict("job", additional_attrs=True, null=True)),
         ("add", Bool("locked")),
     )
+
+    @private
+    def transfer_setting_args(self):
+        return {
+            "DEFAULT": [],
+            "PERFORMANCE": ["--pack-size", "29"],
+            "FAST_STORAGE": ["--pack-size", "58", "--read-concurrency", "100"]
+        }
 
     @private
     async def extend_context(self, rows, extra):
@@ -50,7 +59,10 @@ class CloudBackupService(TaskPathService, CloudTaskServiceMixin, TaskStateMixin)
 
     @private
     async def extend(self, cloud_backup, context):
-        cloud_backup["credentials"] = cloud_backup.pop("credential")
+        cloud_backup["credentials"] = await self.middleware.call(
+            "cloudsync.credentials.extend", cloud_backup.pop("credential"),
+        )
+
         if job := await self.get_task_state_job(context["task_state"], cloud_backup["id"]):
             cloud_backup["job"] = job
 
@@ -69,11 +81,17 @@ class CloudBackupService(TaskPathService, CloudTaskServiceMixin, TaskStateMixin)
 
         return cloud_backup
 
+    @accepts()
+    def transfer_setting_choices(self):
+        args = self.transfer_setting_args()
+        return list(args.keys())
+
     @accepts(Dict(
         "cloud_backup_create",
         *cloud_task_schema,
         Password("password", required=True, empty=False),
         Int("keep_last", required=True, validators=[Range(min_=1)]),
+        Str("transfer_setting", enum=["DEFAULT", "PERFORMANCE", "FAST_STORAGE"], default="DEFAULT"),
         register=True,
     ))
     @pass_app(rest=True)

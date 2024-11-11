@@ -183,6 +183,25 @@ class InterfaceService(CRUDService):
     async def query_names_only(self):
         return [i['int_interface'] for i in await self.middleware.call('datastore.query', 'network.interfaces')]
 
+    @private
+    def ignore_usb_nics(self, ha_hardware=None):
+        """Currently, there is 0 reason to expose USB based NICs
+        using our API on most of the platforms we sell."""
+        if ha_hardware is None:
+            ha_hardware = self.middleware.call_sync('system.is_ha_capable')
+
+        if ha_hardware:
+            # if it's HA capable, 0 reason to show a USB NIC
+            # since it's guaranteed to be coming from IPMI or
+            # 100% _not_ qualified by our platform team
+            return True
+
+        platform = self.middleware.call_sync('truenas.get_chassis_hardware')
+        if platform == 'TRUENAS-UNKNOWN' or 'MINI' in platform:
+            return False
+
+        return True
+
     @filterable
     def query(self, filters, options):
         """
@@ -196,22 +215,11 @@ class InterfaceService(CRUDService):
         }
         ha_hardware = self.middleware.call_sync('system.is_ha_capable')
         ignore = self.middleware.call_sync('interface.internal_interfaces')
-
-        # need to handle these platforms specially
-        fseries = hseries = False
-        platform = self.middleware.call_sync('truenas.get_chassis_hardware')
-        if platform.startswith('TRUENAS-F'):
-            fseries = True
-        elif platform.startswith('TRUENAS-H'):
-            hseries = True
-
+        ignore_usb_nics = self.ignore_usb_nics(ha_hardware)
         for name, iface in netif.list_interfaces().items():
             if (name in ignore) or (iface.cloned and name not in configs):
                 continue
-            elif any((fseries, hseries)) and iface.bus == 'usb':
-                # The {f/h}-series platforms will add a usb ethernet device to the system
-                # when someone opens up the ikvm html5 console. We need to hide this
-                # interface so users can't configure it
+            elif ignore_usb_nics and iface.bus == 'usb':
                 continue
 
             if retrieve_names_only:
@@ -1072,8 +1080,22 @@ class InterfaceService(CRUDService):
                 # newly created laggs.
                 if not update:
                     if data.get('failover_critical') and data.get('lag_protocol') == 'FAILOVER':
-                        msg = 'A lagg interface using the "Failover" protocol '
+                        msg = 'A bond interface using the "Failover" protocol '
                         msg += 'is not allowed to be marked critical for failover.'
+                        verrors.add(f'{schema_name}.failover_critical', msg)
+                    elif virtual_node_ips == 0 and data.get('failover_critical'):
+                        # We allow "empty" bond configurations because, most often times,
+                        # the user will put vlans on top of it. However, some users
+                        # will mark the bond interface as critical for failover and
+                        # will NOT mark the child interfaces critical for failover. This
+                        # paints the false impression that when the bond goes down, a
+                        # failover event will be generated. This is not the case because
+                        # we act upon network events for generating failover events. If
+                        # the bond has no IP address, then it will not generate a failover
+                        # event and because the child interface isn't marked critical for
+                        # failover, a failover will not take place.
+                        msg = 'A bond interface that is marked critical for failover must'
+                        msg += ' have ip addresses configured.'
                         verrors.add(f'{schema_name}.failover_critical', msg)
 
     def __validate_aliases(self, verrors, schema_name, data, ifaces):

@@ -2,10 +2,14 @@ import errno
 
 import middlewared.sqlalchemy as sa
 
-from middlewared.schema import accepts, Bool, Dict, Int, IPAddr, List, Patch, Str, ValidationErrors
-from middlewared.service import CallError, ConfigService, job, private, returns
+from middlewared.api import api_method
+from middlewared.api.current import (
+    DockerEntry, DockerStatusArgs, DockerStatusResult, DockerUpdateArgs, DockerUpdateResult,
+    NvidiaStatusArgs, NvidiaStatusResult,
+)
+from middlewared.schema import ValidationErrors
+from middlewared.service import CallError, ConfigService, job, private
 from middlewared.utils.zfs import query_imported_fast_impl
-from middlewared.validators import Range
 
 from .state_utils import Status
 from .utils import applications_ds_name
@@ -29,37 +33,14 @@ class DockerService(ConfigService):
         datastore_extend = 'docker.config_extend'
         cli_namespace = 'app.docker'
         role_prefix = 'DOCKER'
-
-    ENTRY = Dict(
-        'docker_entry',
-        Bool('enable_image_updates', required=True),
-        Int('id', required=True),
-        Str('dataset', required=True),
-        Str('pool', required=True, null=True),
-        Bool('nvidia', required=True),
-        List('address_pools', items=[
-             Dict(
-                 'address_pool',
-                 IPAddr('base', cidr=True),
-                 Int('size', validators=[Range(min_=1, max_=32)])
-             )
-        ]),
-        update=True,
-    )
+        entry = DockerEntry
 
     @private
     async def config_extend(self, data):
         data['dataset'] = applications_ds_name(data['pool']) if data.get('pool') else None
         return data
 
-    @accepts(
-        Patch(
-            'docker_entry', 'docker_update',
-            ('rm', {'name': 'id'}),
-            ('rm', {'name': 'dataset'}),
-            ('attr', {'update': True}),
-        )
-    )
+    @api_method(DockerUpdateArgs, DockerUpdateResult)
     @job(lock='docker_update')
     async def do_update(self, job, data):
         """
@@ -144,21 +125,63 @@ class DockerService(ConfigService):
         job.set_progress(100, 'Requested configuration applied')
         return await self.config()
 
-    @accepts(roles=['DOCKER_READ'])
-    @returns(Dict(
-        Str('status', enum=[e.value for e in Status]),
-        Str('description'),
-    ))
+    @api_method(DockerStatusArgs, DockerStatusResult, roles=['DOCKER_READ'])
     async def status(self):
         """
         Returns the status of the docker service.
         """
         return await self.middleware.call('docker.state.get_status_dict')
 
-    @accepts(roles=['DOCKER_READ'])
-    @returns(Bool())
-    async def lacks_nvidia_drivers(self):
+    @api_method(NvidiaStatusArgs, NvidiaStatusResult, roles=['DOCKER_READ'])
+    async def nvidia_status(self):
         """
-        Returns true if an NVIDIA GPU is present, but NVIDIA drivers are not installed.
+        Returns Nvidia hardware and drivers installation status.
         """
-        return await self.middleware.call('nvidia.present') and not await self.middleware.call('nvidia.installed')
+        return await self.nvidia_status_for_job()
+
+    @private
+    async def nvidia_status_for_job(self, job=None):
+        if not await self.middleware.call('nvidia.present'):
+            return {'status': 'ABSENT'}
+
+        if job is None:
+            jobs = await self.middleware.call('core.get_jobs', [['method', '=', 'nvidia.install']])
+            if not jobs:
+                return {'status': 'NOT_INSTALLED'}
+
+            job = jobs[-1]
+
+        match job['state']:
+            case 'WAITING':
+                return {'status': 'INSTALLING', 'progress': 0, 'description': 'Waiting for installation to begin...'}
+            case 'RUNNING':
+                return {
+                    'status': 'INSTALLING',
+                    'progress': job['progress']['percent'],
+                    'description': job['progress']['description'],
+                }
+            case 'FAILED':
+                return {'status': 'INSTALL_ERROR', 'error': job['error']}
+
+        if await self.middleware.call('nvidia.installed'):
+            return {'status': 'INSTALLED'}
+
+        return {'status': 'NOT_INSTALLED'}
+
+
+async def update_nvidia_status(middleware, event_type, args):
+    if event_type == 'CHANGED' and args['fields']['method'] == 'nvidia.install':
+        middleware.send_event(
+            'docker.nvidia_status',
+            'CHANGED',
+            fields=await middleware.call('docker.nvidia_status_for_job', args['fields']),
+        )
+
+
+async def setup(middleware):
+    middleware.event_register(
+        'docker.nvidia_status',
+        'Sent on Nvidia hardware and drivers installation status change.',
+        roles=['DOCKER_READ'],
+    )
+    middleware.event_subscribe('core.get_jobs', update_nvidia_status)

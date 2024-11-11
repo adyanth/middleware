@@ -1,3 +1,4 @@
+import json
 import os
 import types
 
@@ -32,11 +33,27 @@ def clean():
     bucket.objects.filter(Prefix="cloud_backup/").delete()
 
 
+def parse_log(task_id):
+    log = ssh("cat " + call("cloud_backup.get_instance", task_id)["job"]["logs_path"])
+    return [json.loads(line) for line in log.strip().split("\n")]
+
+
+def validate_log(task_id, **kwargs):
+    log = parse_log(task_id)
+    log, summary = log[:-2], log[-2]
+
+    for message in log:
+        if message["message_type"] == "error":
+            pytest.fail(f'Received restic error {message}')
+
+    assert all(summary[k] == v for k, v in kwargs.items())
+
+
 @pytest.fixture(scope="module")
 def s3_credential():
     with credential({
-        "provider": "S3",
-        "attributes": {
+        "provider": {
+            "type": "S3",
             "access_key_id": AWS_ACCESS_KEY_ID,
             "secret_access_key": AWS_SECRET_ACCESS_KEY,
         },
@@ -45,7 +62,7 @@ def s3_credential():
 
 
 @pytest.fixture(scope="function")
-def cloud_backup_task(s3_credential):
+def cloud_backup_task(s3_credential, request):
     clean()
 
     with dataset("cloud_backup") as local_dataset:
@@ -58,6 +75,7 @@ def cloud_backup_task(s3_credential):
             },
             "password": "test",
             "keep_last": 100,
+            **getattr(request, "param", {})
         }) as t:
             yield types.SimpleNamespace(
                 local_dataset=local_dataset,
@@ -66,55 +84,56 @@ def cloud_backup_task(s3_credential):
 
 
 def test_cloud_backup(cloud_backup_task):
-    assert call("cloud_backup.list_snapshots", cloud_backup_task.task["id"]) == []
+    task_ = cloud_backup_task.task
+    task_id_ = task_["id"]
+    local_dataset_ = cloud_backup_task.local_dataset
 
-    ssh(f"dd if=/dev/urandom of=/mnt/{cloud_backup_task.local_dataset}/blob1 bs=1M count=1")
-    run_task(cloud_backup_task.task)
+    assert call("cloud_backup.list_snapshots", task_id_) == []
 
-    logs = ssh("cat " + call("cloud_backup.get_instance", cloud_backup_task.task["id"])["job"]["logs_path"])
-    assert "unable to open cache:" not in logs
-    assert "Files:           1 new,     0 changed,     0 unmodified" in logs
+    ssh(f"dd if=/dev/urandom of=/mnt/{local_dataset_}/blob1 bs=1M count=1")
+    run_task(task_)
 
-    snapshots = call("cloud_backup.list_snapshots", cloud_backup_task.task["id"])
-    assert len(snapshots) == 1
-    assert (snapshots[0]["time"] - call("system.info")["datetime"]).total_seconds() < 300
-    assert snapshots[0]["paths"] == [f"/mnt/{cloud_backup_task.local_dataset}"]
+    validate_log(task_id_, files_new=1, files_changed=0, files_unmodified=0)
+
+    snapshots = call("cloud_backup.list_snapshots", task_id_)
     first_snapshot = snapshots[0]
+    assert len(snapshots) == 1
+    assert (first_snapshot["time"] - call("system.info")["datetime"]).total_seconds() < 300
+    assert first_snapshot["paths"] == [f"/mnt/{local_dataset_}"]
 
-    ssh(f"mkdir /mnt/{cloud_backup_task.local_dataset}/dir1")
-    ssh(f"dd if=/dev/urandom of=/mnt/{cloud_backup_task.local_dataset}/dir1/blob2 bs=1M count=1")
+    ssh(f"mkdir /mnt/{local_dataset_}/dir1")
+    ssh(f"dd if=/dev/urandom of=/mnt/{local_dataset_}/dir1/blob2 bs=1M count=1")
 
-    run_task(cloud_backup_task.task)
+    run_task(task_)
 
-    logs = ssh("cat " + call("cloud_backup.get_instance", cloud_backup_task.task["id"])["job"]["logs_path"])
-    assert "Files:           1 new,     0 changed,     1 unmodified" in logs
+    validate_log(task_id_, files_new=1, files_changed=0, files_unmodified=1)
 
-    snapshots = call("cloud_backup.list_snapshots", cloud_backup_task.task["id"])
+    snapshots = call("cloud_backup.list_snapshots", task_id_)
     assert len(snapshots) == 2
 
     contents = call(
         "cloud_backup.list_snapshot_directory",
-        cloud_backup_task.task["id"],
+        task_id_,
         snapshots[-1]["id"],
-        f"/mnt/{cloud_backup_task.local_dataset}",
+        f"/mnt/{local_dataset_}",
     )
     assert len(contents) == 3
     assert contents[0]["name"] == "cloud_backup"
     assert contents[1]["name"] == "blob1"
     assert contents[2]["name"] == "dir1"
 
-    call("cloud_backup.update", cloud_backup_task.task["id"], {"keep_last": 2})
+    call("cloud_backup.update", task_id_, {"keep_last": 2})
 
-    run_task(cloud_backup_task.task)
+    run_task(task_)
 
-    snapshots = call("cloud_backup.list_snapshots", cloud_backup_task.task["id"])
+    snapshots = call("cloud_backup.list_snapshots", task_id_)
     assert all(snapshot["id"] != first_snapshot["id"] for snapshot in snapshots)
 
-    snapshot_to_delete = snapshots[0]
-    call("cloud_backup.delete_snapshot", cloud_backup_task.task["id"], snapshot_to_delete["id"], job=True)
+    snapshot_to_delete_id = snapshots[0]["id"]
+    call("cloud_backup.delete_snapshot", task_id_, snapshot_to_delete_id, job=True)
 
-    snapshots = call("cloud_backup.list_snapshots", cloud_backup_task.task["id"])
-    assert all(snapshot["id"] != snapshot_to_delete["id"] for snapshot in snapshots)
+    snapshots = call("cloud_backup.list_snapshots", task_id_)
+    assert all(snapshot["id"] != snapshot_to_delete_id for snapshot in snapshots)
 
 
 @pytest.fixture(scope="module")
@@ -270,3 +289,23 @@ def test_sync_initializes_repo(cloud_backup_task):
     clean()
 
     call("cloud_backup.sync", cloud_backup_task.task["id"], job=True)
+
+
+def test_transfer_setting_choices():
+    assert call("cloud_backup.transfer_setting_choices") == ["DEFAULT", "PERFORMANCE", "FAST_STORAGE"]
+
+
+@pytest.mark.parametrize("cloud_backup_task, options", [
+    (
+        {"transfer_setting": "PERFORMANCE"},
+        "'--pack-size', '29'"
+    ),
+    (
+        {"transfer_setting": "FAST_STORAGE"},
+        "'--pack-size', '58', '--read-concurrency', '100'"
+    )
+], indirect=["cloud_backup_task"])
+def test_other_transfer_settings(cloud_backup_task, options):
+    run_task(cloud_backup_task.task)
+    result = ssh(f'grep "{options}" /var/log/middlewared.log')
+    assert options in result
