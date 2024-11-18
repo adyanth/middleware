@@ -86,6 +86,7 @@ class VirtInstanceImageChoicesResult(BaseModel):
 
 class Device(BaseModel):
     name: Optional[NonEmptyString] = None
+    description: Optional[NonEmptyString] = None
     readonly: bool = False
 
 
@@ -170,7 +171,7 @@ class VirtInstanceEntry(BaseModel):
     type: InstanceType = 'CONTAINER'
     status: Literal['RUNNING', 'STOPPED']
     cpu: str | None
-    memory: int
+    memory: int | None
     autostart: bool
     environment: dict[str, str]
     aliases: List[VirtInstanceAlias]
@@ -240,7 +241,16 @@ class VirtInstanceDeviceAddArgs(BaseModel):
 
 
 class VirtInstanceDeviceAddResult(BaseModel):
-    result: dict
+    result: Literal[True]
+
+
+class VirtInstanceDeviceUpdateArgs(BaseModel):
+    id: str
+    device: DeviceType
+
+
+class VirtInstanceDeviceUpdateResult(BaseModel):
+    result: Literal[True]
 
 
 class VirtInstanceDeviceDeleteArgs(BaseModel):
@@ -249,7 +259,7 @@ class VirtInstanceDeviceDeleteArgs(BaseModel):
 
 
 class VirtInstanceDeviceDeleteResult(BaseModel):
-    result: dict
+    result: Literal[True]
 
 
 class VirtInstanceStartArgs(BaseModel):

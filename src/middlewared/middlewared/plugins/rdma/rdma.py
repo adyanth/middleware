@@ -87,7 +87,7 @@ class RDMAService(Service):
         """Return a list containing details about each RDMA card.  Dual cards
         will contain two RDMA links."""
         self.logger.info('Fetching RDMA card choices')
-        links = self.middleware.call_sync('rdma.get_link_choices')
+        links = self.middleware.call_sync('rdma.get_link_choices', True)
         grouper = {}
         for link in links:
             rdma = link["rdma"]
@@ -126,7 +126,7 @@ class RDMAService(Service):
             v['name'] = ':'.join(sorted(names))
         return list(grouper.values())
 
-    @api_method(RdmaCapableProtocolsArgs, RdmaCapableProtocolsResult)
+    @api_method(RdmaCapableProtocolsArgs, RdmaCapableProtocolsResult, roles=['SHARING_ADMIN'])
     async def capable_protocols(self):
         result = []
         is_ent = await self.middleware.call('system.is_enterprise')
