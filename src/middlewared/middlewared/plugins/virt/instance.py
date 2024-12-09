@@ -1,4 +1,5 @@
 import aiohttp
+import os
 import platform
 
 from middlewared.service import (
@@ -31,6 +32,7 @@ class VirtInstanceService(CRUDService):
         cli_namespace = 'virt.instance'
         entry = VirtInstanceEntry
         role_prefix = 'VIRT_INSTANCE'
+        event_register = True
 
     @filterable
     async def query(self, filters, options):
@@ -44,14 +46,20 @@ class VirtInstanceService(CRUDService):
         results = (await incus_call('1.0/instances?filter=&recursion=2', 'get'))['metadata']
         entries = []
         for i in results:
-            # If entry has no config or state its probably in an unknown state, skip it
-            if not i.get('config') or not i.get('state'):
-                continue
+            # config may be empty due to a race condition during stop
+            # if thats the case grab instance details without recursion
+            # which means aliases and state will be unknown
+            if not i.get('config'):
+                i = (await incus_call(f'1.0/instances/{i["name"]}', 'get'))['metadata']
+            if not i.get('state'):
+                status = 'UNKNOWN'
+            else:
+                status = i['state']['status'].upper()
             entry = {
                 'id': i['name'],
                 'name': i['name'],
                 'type': 'CONTAINER' if i['type'] == 'container' else 'VM',
-                'status': i['state']['status'].upper(),
+                'status': status,
                 'cpu': i['config'].get('limits.cpu'),
                 'autostart': True if i['config'].get('boot.autostart') == 'true' else False,
                 'environment': {},
@@ -84,7 +92,7 @@ class VirtInstanceService(CRUDService):
                 entry['environment'][k[12:]] = v
             entries.append(entry)
 
-            for v in (i['state']['network'] or {}).values():
+            for v in ((i.get('state') or {}).get('network') or {}).values():
                 for address in v['addresses']:
                     if address['scope'] != 'global':
                         continue
@@ -98,10 +106,20 @@ class VirtInstanceService(CRUDService):
 
     @private
     async def validate(self, new, schema_name, verrors, old=None):
+        # Do not validate image_choices because its an expansive operation, just fail on creation
+
         if not old and await self.query([('name', '=', new['name'])]):
             verrors.add(f'{schema_name}.name', f'Name {new["name"]!r} already exists')
 
-        # Do not validate image_choices because its an expansive operation, just fail on creation
+        if new.get('memory'):
+            meminfo = await self.middleware.call('system.mem_info')
+            if new['memory'] > meminfo['physmem_size']:
+                verrors.add(f'{schema_name}.memory', 'Cannot reserve more than physical memory')
+
+        if new.get('cpu') and new['cpu'].isdigit():
+            cpuinfo = await self.middleware.call('system.cpu_info')
+            if int(new['cpu']) > cpuinfo['core_count']:
+                verrors.add(f'{schema_name}.cpu', 'Cannot reserve more than system cores')
 
     def __data_to_config(self, data: dict, raw: dict = None):
         config = {}
@@ -172,10 +190,13 @@ class VirtInstanceService(CRUDService):
 
         devices = {}
         for i in (data['devices'] or []):
-            await self.middleware.call('virt.instance.validate', i, 'virt_instance_create', verrors)
+            await self.middleware.call('virt.instance.validate_device', i, 'virt_instance_create', verrors)
             if i['name'] is None:
                 i['name'] = await self.middleware.call('virt.instance.generate_device_name', devices.keys(), i['dev_type'])
             devices[i['name']] = await self.middleware.call('virt.instance.device_to_incus', data['instance_type'], i)
+
+        if not verrors and data['devices']:
+            await self.middleware.call('virt.instance.validate_devices', data['devices'], 'virt_instance_create', verrors)
 
         verrors.check()
 
@@ -318,3 +339,24 @@ class VirtInstanceService(CRUDService):
         }})
 
         return True
+
+    @private
+    def get_shell(self, id):
+        """
+        Method to get a valid shell to be used by default.
+        """
+
+        self.middleware.call_sync('virt.global.check_initialized')
+        instance = self.middleware.call_sync('virt.instance.get_instance', id)
+        if instance['type'] != 'CONTAINER':
+            raise CallError('Only available for containers.')
+        if instance['status'] != 'RUNNING':
+            raise CallError('Container must be running.')
+        config = self.middleware.call_sync('virt.global.config')
+        mount_info = self.middleware.call_sync('filesystem.mount_info', [['mount_source', '=', f'{config["dataset"]}/containers/{id}']])
+        if not mount_info:
+            return None
+        rootfs = f'{mount_info[0]["mountpoint"]}/rootfs'
+        for i in ('/bin/bash', '/bin/zsh', '/bin/csh', '/bin/sh'):
+            if os.path.exists(f'{rootfs}{i}'):
+                return i

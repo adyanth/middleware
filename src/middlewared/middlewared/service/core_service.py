@@ -19,7 +19,13 @@ import middlewared.main
 from middlewared.api import api_method
 from middlewared.api.base.jsonschema import get_json_schema
 from middlewared.api.current import (
-    CoreSetOptionsArgs, CoreSetOptionsResult, CoreSubscribeArgs, CoreSubscribeResult, CoreUnsubscribeArgs,
+    CorePingArgs,
+    CorePingResult,
+    CoreSetOptionsArgs,
+    CoreSetOptionsResult,
+    CoreSubscribeArgs,
+    CoreSubscribeResult,
+    CoreUnsubscribeArgs,
     CoreUnsubscribeResult,
 )
 from middlewared.common.environ import environ_update
@@ -344,7 +350,7 @@ class CoreService(Service):
                 # Skip private methods
                 if hasattr(method, '_private') and method._private is True:
                     continue
-                if target == 'CLI' and hasattr(method, '_cli_private'):
+                if target == 'CLI' and getattr(method, '_cli_private', False):
                     continue
 
                 # terminate is a private method used to clean up a service on shutdown
@@ -522,8 +528,7 @@ class CoreService(Service):
         kwargs = kwargs or {}
         self.middleware.send_event(name, event_type, **kwargs)
 
-    @no_authz_required
-    @accepts()
+    @api_method(CorePingArgs, CorePingResult, authorization_required=False)
     def ping(self):
         """
         Utility method which just returns "pong".
